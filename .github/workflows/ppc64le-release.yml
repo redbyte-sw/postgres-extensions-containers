@@ -1,0 +1,86 @@
+# Downstream (redByte-sw) build of the extension images with linux/ppc64le support.
+#
+# Upstream's bake workflows push to ghcr.io/${{ github.repository_owner }}, which is not
+# a valid image reference for the redByte-sw owner (uppercase), and build on top of
+# ghcr.io/cloudnative-pg/postgresql, which has no ppc64le variant. This workflow builds
+# PostgreSQL 18 / trixie extension images on top of our own PostgreSQL image.
+#
+# Requires: ghcr.io/<owner>/postgresql:18-minimal-trixie (postgres-containers ppc64le-release),
+#           readable by this repository's GITHUB_TOKEN.
+# Trigger:  push to the ppc64le branch, or run manually.
+# Result:   ghcr.io/<owner>/<extension image>:<ext version>-18-trixie, ...
+name: ppc64le-release
+on:
+  push:
+    branches:
+      - ppc64le
+  workflow_dispatch:
+
+permissions: read-all
+
+env:
+  PG_MAJOR: "18"
+  DISTRO: trixie
+
+jobs:
+  images:
+    name: Build and push ${{ matrix.extension }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        extension:
+          - pg-crash
+          - pg-ivm
+          - pgaudit
+          - pgrouting
+          - pgvector
+          - postgis
+          - timescaledb-oss
+          - wal2json
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4
+        with:
+          platforms: linux/arm64,linux/ppc64le
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+
+      - name: Login into ghcr.io
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        env:
+          EXTENSION: ${{ matrix.extension }}
+        run: |
+          # image names must be lowercase (owner is redByte-sw)
+          owner=${GITHUB_REPOSITORY_OWNER,,}
+          files="-f docker-bake.hcl -f ${EXTENSION}/metadata.hcl"
+          # target names embed the extension version, e.g. pgvector-0_8_6-18-trixie
+          target=$(docker buildx bake ${files} --print | jq -r --arg s "-${PG_MAJOR}-${DISTRO}" '.target | keys[] | select(endswith($s))')
+          test -n "${target}"
+          environment=production registry=ghcr.io/${owner} revision=${GITHUB_SHA} \
+            docker buildx bake ${files} --push --metadata-file bake-metadata.json \
+              --set "*.args.BASE=ghcr.io/${owner}/postgresql:${PG_MAJOR}-minimal-${DISTRO}" \
+              "${target}"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Sign images
+        run: |
+          images=$(jq -r '.[] | (."image.name" | sub(",.*";"")) + "@" + ."containerimage.digest"' bake-metadata.json)
+          cosign sign --yes ${images}
+          jq -r '.[] | ."image.name" | split(",")[] | "- `" + . + "`"' bake-metadata.json >> $GITHUB_STEP_SUMMARY
